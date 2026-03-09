@@ -8,7 +8,10 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("Frontend", policy => policy
-        .WithOrigins("http://localhost:4300", "http://localhost:4200")
+        .SetIsOriginAllowed(origin =>
+            origin.StartsWith("http://localhost:") ||
+            origin.StartsWith("https://") ||
+            origin.StartsWith("http://"))
         .AllowAnyHeader()
         .AllowAnyMethod()
         .AllowCredentials());
@@ -32,7 +35,6 @@ app.MapPost("/api/sync/push", async (
     var accepted = await store.AppendEventsAsync(request.Events, ct);
     var serverTime = await store.GetServerTimeAsync(ct);
 
-    // notify realtime clients to pull latest changes
     await hub.Clients.All.SendAsync("todosChanged", new { serverTime }, ct);
 
     return Results.Ok(new SyncPushResponse { AcceptedEventIds = accepted.ToList() });
@@ -45,7 +47,12 @@ app.MapGet("/api/sync/pull", async (
 {
     var sinceValue = since ?? 0;
     var todos = await store.PullTodosSinceAsync(sinceValue, ct);
-    var serverTime = await store.GetServerTimeAsync(ct);
+
+    // Watermark should follow persisted todo update timestamps, not wall-clock now,
+    // to avoid skipping updates (e.g. reorder) between pulls.
+    var maxUpdatedAt = todos.Count > 0 ? todos.Max(x => x.UpdatedAt) : sinceValue;
+    var serverTime = Math.Max(sinceValue, maxUpdatedAt);
+
     return Results.Ok(new SyncPullResponse
     {
         Todos = todos.ToList(),
@@ -53,6 +60,48 @@ app.MapGet("/api/sync/pull", async (
     });
 });
 
+
+app.MapGet("/api/sync/v2/pull", async (
+    long? sinceChangeId,
+    int? limit,
+    string? cursor,
+    IEventStoreService store,
+    CancellationToken ct) =>
+{
+    var sinceValue = sinceChangeId ?? 0;
+    var take = Math.Clamp(limit ?? 300, 1, 500);
+
+    var todos = (await store.PullTodosSinceAsync(sinceValue, ct)).ToList();
+
+    var offset = 0;
+    if (!string.IsNullOrWhiteSpace(cursor) && int.TryParse(cursor, out var parsed) && parsed >= 0)
+    {
+        offset = parsed;
+    }
+
+    var page = todos.Skip(offset).Take(take).ToList();
+    var nextOffset = offset + page.Count;
+    var hasMore = nextOffset < todos.Count;
+
+    var changes = page.Select(t => new
+    {
+        changeId = t.UpdatedAt,
+        entityType = "todo",
+        entityId = t.Id,
+        op = t.Deleted ? "delete" : "upsert",
+        payload = t,
+    }).ToList();
+
+    var serverWatermark = todos.Count > 0 ? Math.Max(sinceValue, todos.Max(x => x.UpdatedAt)) : sinceValue;
+
+    return Results.Ok(new
+    {
+        changes,
+        serverWatermark,
+        nextCursor = hasMore ? nextOffset.ToString() : null,
+        hasMore,
+    });
+});
 app.MapGet("/api/sync/all", async (IEventStoreService store, CancellationToken ct) =>
 {
     var todos = await store.GetAllAsync(ct);
@@ -62,3 +111,6 @@ app.MapGet("/api/sync/all", async (IEventStoreService store, CancellationToken c
 app.MapHub<SyncHub>("/hubs/sync");
 
 app.Run("http://localhost:3000");
+
+
+
