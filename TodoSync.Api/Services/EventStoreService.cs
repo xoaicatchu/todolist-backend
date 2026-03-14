@@ -104,12 +104,14 @@ public sealed class EventStoreService : IEventStoreService
                 var title = ReadPayloadString(e.Payload, "title") ?? "";
                 var priority = ReadPayloadString(e.Payload, "priority") ?? "MEDIUM";
                 var dayKey = ReadPayloadString(e.Payload, "dayKey") ?? DateOnly.FromDateTime(DateTime.UtcNow).ToString("yyyy-MM-dd");
+                var maxOrder = _todos.Values.Where(x => x.DayKey == dayKey).Select(x => x.SortOrder).DefaultIfEmpty(0).Max();
                 _todos[e.TodoId] = new TodoItem
                 {
                     Id = e.TodoId,
                     Title = title,
                     Priority = priority,
                     DayKey = dayKey,
+                    SortOrder = maxOrder + 1,
                     Completed = false,
                     CreatedAt = now,
                     UpdatedAt = now,
@@ -132,6 +134,25 @@ public sealed class EventStoreService : IEventStoreService
                 current.CreatedAt = current.CreatedAt == 0 ? current.UpdatedAt : current.CreatedAt;
                 current.UpdatedAt = now;
                 _todos[e.TodoId] = current;
+                break;
+
+
+            case "TODO_REORDERED":
+                var reorderDayKey = ReadPayloadString(e.Payload, "dayKey");
+                var orderedIds = ReadPayloadStringArray(e.Payload, "orderedIds");
+                if (!string.IsNullOrWhiteSpace(reorderDayKey) && orderedIds is not null)
+                {
+                    for (int i = 0; i < orderedIds.Count; i++)
+                    {
+                        var id = orderedIds[i];
+                        if (_todos.TryGetValue(id, out var row) && row.DayKey == reorderDayKey)
+                        {
+                            row.SortOrder = i + 1;
+                            row.UpdatedAt = now;
+                            _todos[id] = row;
+                        }
+                    }
+                }
                 break;
 
             case "TODO_DELETED":
@@ -159,6 +180,21 @@ public sealed class EventStoreService : IEventStoreService
         if (payload is null) return null;
         if (payload.Value.ValueKind != JsonValueKind.Object) return null;
         return payload.Value.TryGetProperty(property, out var p) ? p.GetString() : null;
+    }
+
+
+    private static List<string>? ReadPayloadStringArray(JsonElement? payload, string property)
+    {
+        if (payload is null) return null;
+        if (payload.Value.ValueKind != JsonValueKind.Object) return null;
+        if (!payload.Value.TryGetProperty(property, out var p) || p.ValueKind != JsonValueKind.Array) return null;
+        var result = new List<string>();
+        foreach (var x in p.EnumerateArray())
+        {
+            var s = x.GetString();
+            if (!string.IsNullOrWhiteSpace(s)) result.Add(s);
+        }
+        return result;
     }
 
     private static TodoItem? ReadPayloadTodo(JsonElement? payload)
@@ -221,6 +257,7 @@ public sealed class EventStoreService : IEventStoreService
         Title = t.Title,
         Priority = t.Priority,
         DayKey = t.DayKey,
+        SortOrder = t.SortOrder,
         Completed = t.Completed,
         CreatedAt = t.CreatedAt,
         UpdatedAt = t.UpdatedAt,

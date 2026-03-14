@@ -6,6 +6,7 @@ public sealed class TodoItem
     public required string Title { get; set; }
     public string Priority { get; set; } = "MEDIUM";
     public string DayKey { get; set; } = DateOnly.FromDateTime(DateTime.UtcNow).ToString("yyyy-MM-dd");
+    public int SortOrder { get; set; }
     public bool Completed { get; set; }
     public long CreatedAt { get; set; }
     public long UpdatedAt { get; set; }
