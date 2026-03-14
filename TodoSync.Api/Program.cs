@@ -112,5 +112,5 @@ app.MapHub<SyncHub>("/hubs/sync");
 
 app.Run("http://localhost:3000");
 
-
-
+// Make Program class accessible for integration tests
+public partial class Program { }

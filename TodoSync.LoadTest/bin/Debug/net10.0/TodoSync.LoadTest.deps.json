@@ -1,0 +1,39 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v10.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v10.0": {
+      "TodoSync.LoadTest/1.0.0": {
+        "dependencies": {
+          "TodoSync.Api": "1.0.0"
+        },
+        "runtime": {
+          "TodoSync.LoadTest.dll": {}
+        }
+      },
+      "TodoSync.Api/1.0.0": {
+        "runtime": {
+          "TodoSync.Api.dll": {
+            "assemblyVersion": "1.0.0.0",
+            "fileVersion": "1.0.0.0"
+          }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "TodoSync.LoadTest/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "TodoSync.Api/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    }
+  }
+}
