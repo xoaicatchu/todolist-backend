@@ -1,4 +1,4 @@
-﻿namespace TodoSync.Api.Models;
+namespace TodoSync.Api.Models;
 
 public sealed class SyncPushRequest
 {
@@ -14,4 +14,10 @@ public sealed class SyncPullResponse
 {
     public List<TodoItem> Todos { get; set; } = [];
     public long ServerTime { get; set; }
+}
+
+public sealed class SyncPushMessage
+{
+    public string TenantId { get; set; } = "default";
+    public List<TodoEvent> Events { get; set; } = [];
 }

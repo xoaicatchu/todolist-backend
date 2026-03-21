@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dotnet sln:*)",
+      "Bash(dotnet add:*)",
+      "Bash(dotnet restore:*)",
+      "Bash(dotnet test:*)",
+      "Bash(dotnet build:*)",
+      "Bash(where k6:*)",
+      "Bash(curl -s http://localhost:3000)",
+      "Bash(dotnet run:*)",
+      "Bash(git add:*)"
+    ]
+  }
+}

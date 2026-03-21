@@ -1,0 +1,16 @@
+**/bin
+**/obj
+**/node_modules
+**/.vs
+**/.vscode
+**/.git
+**/pgbouncer
+**/nginx
+**/observability
+**/TodoSync.Tests
+**/TodoSync.LoadTest
+**/Bao_Cao_Toi_Uu_Hieu_Nang.md
+**/PHASE1_OPTIMIZATION_REPORT.md
+*.md
+.gitignore
+docker-compose.yml

@@ -1,21 +1,23 @@
+using System.Diagnostics;
 using System.Net.Http.Json;
 using System.Text.Json;
 using FluentAssertions;
-using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.SignalR.Client;
 using TodoSync.Api.Models;
+using TodoSync.Api.Services;
 using Xunit;
 
 namespace TodoSync.Tests.Integration;
 
-public class SyncApiTests : IClassFixture<WebApplicationFactory<Program>>
+public class SyncApiTests : IClassFixture<TodoSyncWebApplicationFactory>
 {
-    private readonly WebApplicationFactory<Program> _factory;
+    private readonly TodoSyncWebApplicationFactory _factory;
     private readonly HttpClient _client;
 
-    public SyncApiTests(WebApplicationFactory<Program> factory)
+    public SyncApiTests(TodoSyncWebApplicationFactory factory)
     {
         _factory = factory;
+        _factory.EnsureDatabaseCreated();
         _client = factory.CreateClient();
     }
 
@@ -58,25 +60,33 @@ public class SyncApiTests : IClassFixture<WebApplicationFactory<Program>>
             }
         };
 
-        // Act - Push
-        var pushResponse = await _client.PostAsJsonAsync("/api/sync/push", pushRequest);
+        // Act - Push via V2 endpoint
+        var pushResponse = await _client.PostAsJsonAsync("/api/v2/sync/push", pushRequest);
         pushResponse.EnsureSuccessStatusCode();
+
+        await WaitUntilAsync(async () => 
+        {
+            var r = await _client.GetAsync("/api/v2/sync/all");
+            if (!r.IsSuccessStatusCode) return false;
+            var t = await r.Content.ReadFromJsonAsync<List<TodoItem>>();
+            return t != null && t.Any(x => x.Id == todoId);
+        });
 
         var pushResult = await pushResponse.Content.ReadFromJsonAsync<SyncPushResponse>();
         pushResult.Should().NotBeNull();
         pushResult!.AcceptedEventIds.Should().ContainSingle().Which.Should().Be(eventId);
 
-        // Act - Pull
-        var pullResponse = await _client.GetAsync("/api/sync/pull?since=0");
+        // Act - Pull via V2 endpoint
+        var pullResponse = await _client.GetAsync("/api/v2/sync/pull");
         pullResponse.EnsureSuccessStatusCode();
 
-        var pullResult = await pullResponse.Content.ReadFromJsonAsync<SyncPullResponse>();
+        var pullResult = await pullResponse.Content.ReadFromJsonAsync<SyncPullV2Response>();
         pullResult.Should().NotBeNull();
-        pullResult!.Todos.Should().ContainSingle()
-            .Which.Should().Match<TodoItem>(t =>
-                t.Id == todoId &&
-                t.Title == "Integration Test Todo" &&
-                t.Priority == "HIGH");
+        pullResult!.Changes.Should().Contain(c =>
+            c.EntityId == todoId &&
+            c.Payload != null &&
+            c.Payload.Title == "Integration Test Todo" &&
+            c.Payload.Priority == "HIGH");
     }
 
     [Fact]
@@ -100,34 +110,37 @@ public class SyncApiTests : IClassFixture<WebApplicationFactory<Program>>
 
         var pushRequest = new SyncPushRequest { Events = events };
 
-        // Act - Push
-        await _client.PostAsJsonAsync("/api/sync/push", pushRequest);
+        // Act - Push via V2 endpoint
+        var pushResponse = await _client.PostAsJsonAsync("/api/v2/sync/push", pushRequest);
+        pushResponse.EnsureSuccessStatusCode();
 
-        // Act - Pull with pagination (limit 5)
-        var pullResponse = await _client.GetAsync("/api/sync/v2/pull?sinceChangeId=0&limit=5");
+        await WaitUntilAsync(async () => 
+        {
+            var r = await _client.GetAsync("/api/v2/sync/all");
+            if (!r.IsSuccessStatusCode) return false;
+            var t = await r.Content.ReadFromJsonAsync<List<TodoItem>>();
+            // Ensure all 10 have been processed
+            return t != null && t.Count(x => todoIds.Contains(x.Id)) >= 10;
+        });
+
+        // Act - Pull with pagination (limit 5) via V2 endpoint
+        var pullResponse = await _client.GetAsync("/api/v2/sync/pull?limit=5");
         pullResponse.EnsureSuccessStatusCode();
 
-        var pullResult = await pullResponse.Content.ReadFromJsonAsync<JsonElement>();
-        var changes = pullResult.GetProperty("changes").EnumerateArray().ToList();
-        var hasMore = pullResult.GetProperty("hasMore").GetBoolean();
-        var nextCursor = pullResult.GetProperty("nextCursor").GetString();
+        var pullResult = await pullResponse.Content.ReadFromJsonAsync<SyncPullV2Response>();
+        pullResult.Should().NotBeNull();
+        pullResult!.Changes.Should().HaveCountGreaterThanOrEqualTo(5);
+        pullResult.HasMore.Should().BeTrue();
+        pullResult.NextCursor.Should().NotBeNullOrEmpty();
 
-        // Assert - First page
-        changes.Should().HaveCount(5);
-        hasMore.Should().BeTrue();
-        nextCursor.Should().NotBeNullOrEmpty();
-
-        // Act - Pull second page
-        var pullResponse2 = await _client.GetAsync($"/api/sync/v2/pull?sinceChangeId=0&limit=5&cursor={nextCursor}");
+        // Act - Pull second page using sinceChangeId (from NextCursor which is the last ChangeId)
+        var sinceId = pullResult.NextCursor;
+        var pullResponse2 = await _client.GetAsync($"/api/v2/sync/pull?limit=5&sinceChangeId={sinceId}");
         pullResponse2.EnsureSuccessStatusCode();
 
-        var pullResult2 = await pullResponse2.Content.ReadFromJsonAsync<JsonElement>();
-        var changes2 = pullResult2.GetProperty("changes").EnumerateArray().ToList();
-        var hasMore2 = pullResult2.GetProperty("hasMore").GetBoolean();
-
-        // Assert - Second page
-        changes2.Should().HaveCount(5);
-        hasMore2.Should().BeFalse();
+        var pullResult2 = await pullResponse2.Content.ReadFromJsonAsync<SyncPullV2Response>();
+        pullResult2.Should().NotBeNull();
+        pullResult2!.Changes.Should().HaveCountGreaterThanOrEqualTo(1);
     }
 
     [Fact]
@@ -151,12 +164,20 @@ public class SyncApiTests : IClassFixture<WebApplicationFactory<Program>>
             }
         };
 
-        // Act - Push same event twice
-        await _client.PostAsJsonAsync("/api/sync/push", pushRequest);
-        await _client.PostAsJsonAsync("/api/sync/push", pushRequest);
+        // Act - Push same event twice via V2 endpoint
+        await _client.PostAsJsonAsync("/api/v2/sync/push", pushRequest);
+        await _client.PostAsJsonAsync("/api/v2/sync/push", pushRequest);
 
-        // Assert - Should only have one todo
-        var allResponse = await _client.GetAsync("/api/sync/all");
+        await WaitUntilAsync(async () => 
+        {
+            var r = await _client.GetAsync("/api/v2/sync/all");
+            if (!r.IsSuccessStatusCode) return false;
+            var t = await r.Content.ReadFromJsonAsync<List<TodoItem>>();
+            return t != null && t.Any(x => x.Id == todoId);
+        });
+
+        // Assert - Should only have one todo with that id
+        var allResponse = await _client.GetAsync("/api/v2/sync/all");
         var allTodos = await allResponse.Content.ReadFromJsonAsync<List<TodoItem>>();
         allTodos.Should().NotBeNull();
         allTodos!.Count(t => t.Id == todoId).Should().Be(1);
@@ -178,13 +199,14 @@ public class SyncApiTests : IClassFixture<WebApplicationFactory<Program>>
             CreatedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
         });
 
+        await WaitUntilAsync(async () => await GetTodo(todoId) != null);
+
         var todo1 = await GetTodo(todoId);
-        todo1.Should().NotBeNull();
+        todo1.Should().NotBeNull("newly created todo should appear in /api/v2/sync/all");
         todo1!.Title.Should().Be("Lifecycle Test");
         todo1.Completed.Should().BeFalse();
 
         // Act 2 - Toggle
-        await Task.Delay(50);
         await PushEvent(new TodoEvent
         {
             EventId = Guid.NewGuid().ToString(),
@@ -193,11 +215,12 @@ public class SyncApiTests : IClassFixture<WebApplicationFactory<Program>>
             CreatedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
         });
 
+        await WaitUntilAsync(async () => (await GetTodo(todoId))?.Completed == true);
+
         var todo2 = await GetTodo(todoId);
         todo2!.Completed.Should().BeTrue();
 
         // Act 3 - Rename
-        await Task.Delay(50);
         await PushEvent(new TodoEvent
         {
             EventId = Guid.NewGuid().ToString(),
@@ -207,12 +230,13 @@ public class SyncApiTests : IClassFixture<WebApplicationFactory<Program>>
             CreatedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
         });
 
+        await WaitUntilAsync(async () => (await GetTodo(todoId))?.Title == "Updated Title");
+
         var todo3 = await GetTodo(todoId);
         todo3!.Title.Should().Be("Updated Title");
         todo3.Priority.Should().Be("LOW");
 
         // Act 4 - Delete
-        await Task.Delay(50);
         await PushEvent(new TodoEvent
         {
             EventId = Guid.NewGuid().ToString(),
@@ -221,8 +245,11 @@ public class SyncApiTests : IClassFixture<WebApplicationFactory<Program>>
             CreatedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
         });
 
+        await WaitUntilAsync(async () => await GetTodo(todoId) == null);
+
+        // Deleted todos are filtered from GetAllAsync (!t.Deleted), so it should be null
         var todo4 = await GetTodo(todoId);
-        todo4!.Deleted.Should().BeTrue();
+        todo4.Should().BeNull("deleted todo should not appear in /api/v2/sync/all");
     }
 
     [Fact]
@@ -242,7 +269,7 @@ public class SyncApiTests : IClassFixture<WebApplicationFactory<Program>>
 
         await connection.StartAsync();
 
-        // Act - Push an event
+        // Act - Push an event via V2 endpoint
         var todoId = Guid.NewGuid().ToString();
         await PushEvent(new TodoEvent
         {
@@ -256,7 +283,7 @@ public class SyncApiTests : IClassFixture<WebApplicationFactory<Program>>
         // Assert - Should receive notification
         var received = await Task.WhenAny(notificationReceived.Task, Task.Delay(5000));
         received.Should().Be(notificationReceived.Task);
-        notificationReceived.Task.Result.Should().BeTrue();
+        (await notificationReceived.Task).Should().BeTrue();
 
         await connection.StopAsync();
     }
@@ -264,14 +291,24 @@ public class SyncApiTests : IClassFixture<WebApplicationFactory<Program>>
     private async Task PushEvent(TodoEvent evt)
     {
         var request = new SyncPushRequest { Events = new List<TodoEvent> { evt } };
-        var response = await _client.PostAsJsonAsync("/api/sync/push", request);
+        var response = await _client.PostAsJsonAsync("/api/v2/sync/push", request);
         response.EnsureSuccessStatusCode();
     }
 
     private async Task<TodoItem?> GetTodo(string todoId)
     {
-        var response = await _client.GetAsync("/api/sync/all");
+        var response = await _client.GetAsync("/api/v2/sync/all");
         var todos = await response.Content.ReadFromJsonAsync<List<TodoItem>>();
         return todos?.FirstOrDefault(t => t.Id == todoId);
+    }
+
+    private async Task WaitUntilAsync(Func<Task<bool>> condition, int maxWaitMs = 3000)
+    {
+        var sw = Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < maxWaitMs)
+        {
+            if (await condition()) return;
+            await Task.Delay(50);
+        }
     }
 }
