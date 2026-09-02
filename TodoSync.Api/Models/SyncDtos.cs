@@ -1,8 +1,11 @@
 namespace TodoSync.Api.Models;
 
+using TodoSync.Api.Sync.Contracts;
+
 public sealed class SyncPushRequest
 {
     public List<TodoEvent> Events { get; set; } = [];
+    public List<MutationEnvelope> Mutations { get; set; } = [];
 }
 
 public sealed class SyncPushResponse

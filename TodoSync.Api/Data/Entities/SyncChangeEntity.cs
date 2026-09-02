@@ -14,6 +14,10 @@ public class SyncChangeEntity
     [Column("change_id")]
     public Guid ChangeId { get; set; } = Guid.CreateVersion7();
 
+    [Column("change_sequence")]
+    [DatabaseGenerated(DatabaseGeneratedOption.Identity)]
+    public long ChangeSequence { get; set; }
+
     [Column("tenant_id")]
     [MaxLength(36)]
     public string TenantId { get; set; } = "default";

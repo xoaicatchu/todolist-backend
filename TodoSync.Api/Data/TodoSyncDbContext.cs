@@ -34,8 +34,8 @@ public class TodoSyncDbContext : DbContext
             entity.HasIndex(e => new { e.TenantId, e.ChangeId }).HasDatabaseName("idx_sync_changes_tenant_changeid");
             entity.HasIndex(e => new { e.TenantId, e.CreatedAt }).HasDatabaseName("idx_sync_changes_tenant_createdat");
             entity.HasIndex(e => e.EntityId).HasDatabaseName("idx_sync_changes_entityid");
+            entity.HasIndex(e => new { e.TenantId, e.EntityType, e.ChangeSequence }).HasDatabaseName("idx_sync_changes_scope");
         });
-
 
         // ProcessedEventEntity
         modelBuilder.Entity<ProcessedEventEntity>(entity =>
