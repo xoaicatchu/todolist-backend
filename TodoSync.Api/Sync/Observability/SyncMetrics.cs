@@ -29,7 +29,9 @@ public sealed class SyncMetrics
     public void RecordOperation(string operation, string outcome, TimeSpan duration)
     {
         _operations.Add(1, new("operation", operation), new("outcome", outcome));
-        _operationDuration.Record(duration.TotalMilliseconds, new("operation", operation));
+        _operationDuration.Record(
+            duration.TotalMilliseconds,
+            [new("operation", operation)]);
     }
 
     public void RecordPullLag(long lagMs) => _pullLag.Record(Math.Max(0, lagMs));
@@ -40,12 +42,14 @@ public sealed class SyncMetrics
     public void RecordDuplicate(string entityType, int count = 1)
     {
         if (count > 0)
-            _duplicates.Add(count, new("entity_type", entityType));
+            _duplicates.Add(count, [new("entity_type", entityType)]);
     }
 
     public void RecordConsumerFailure(string entityType, string reason) =>
         _consumerFailures.Add(1, new("entity_type", entityType), new("reason", reason));
 
     public void RecordHandlerDuration(string entityType, TimeSpan duration) =>
-        _handlerDuration.Record(duration.TotalMilliseconds, new("entity_type", entityType));
+        _handlerDuration.Record(
+            duration.TotalMilliseconds,
+            [new("entity_type", entityType)]);
 }
