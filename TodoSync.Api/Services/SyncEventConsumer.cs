@@ -2,56 +2,130 @@ using MassTransit;
 using Microsoft.AspNetCore.SignalR;
 using TodoSync.Api.Hubs;
 using TodoSync.Api.Models;
+using TodoSync.Api.Sync.Contracts;
+using TodoSync.Api.Sync.Core;
+using TodoSync.Api.Sync.Observability;
 
 namespace TodoSync.Api.Services;
 
 /// <summary>
-/// Background consumer that processes batches of incoming sync events from RabbitMQ.
-/// This acts as an async buffer to protect PostgreSQL from concurrent write saturation.
+/// Keeps the existing Todo event consumer path and adds a generic message path
+/// beside it. Generic Todo messages eventually delegate to the same Todo service.
 /// </summary>
-public class SyncEventConsumer : IConsumer<Batch<SyncPushMessage>>
+public sealed class SyncEventConsumer :
+    IConsumer<Batch<SyncPushMessage>>,
+    IConsumer<Batch<GenericSyncPushMessage>>
 {
-    private readonly ITodoSyncService _syncService;
+    private readonly ITodoSyncService _todoSyncService;
+    private readonly ISyncService _syncService;
     private readonly IHubContext<SyncHub> _hubContext;
     private readonly ILogger<SyncEventConsumer> _logger;
+    private readonly SyncMetrics _metrics;
 
     public SyncEventConsumer(
-        ITodoSyncService syncService, 
+        ITodoSyncService todoSyncService,
+        ISyncService syncService,
         IHubContext<SyncHub> hubContext,
-        ILogger<SyncEventConsumer> logger)
+        ILogger<SyncEventConsumer> logger,
+        SyncMetrics metrics)
     {
+        _todoSyncService = todoSyncService;
         _syncService = syncService;
         _hubContext = hubContext;
         _logger = logger;
+        _metrics = metrics;
     }
 
     public async Task Consume(ConsumeContext<Batch<SyncPushMessage>> context)
     {
-        _logger.LogInformation("Received batch of {Count} push messages from message broker", context.Message.Length);
-
-        // Group messages by tenant ID to avoid cross-tenant database transactions
         var groups = context.Message
-            .SelectMany(m => m.Message.Events.Select(e => new { m.Message.TenantId, Event = e }))
+            .SelectMany(message => message.Message.Events.Select(evt => new
+            {
+                message.Message.TenantId,
+                Event = evt
+            }))
             .GroupBy(x => x.TenantId);
 
         foreach (var group in groups)
         {
-            var tenantId = group.Key;
-            var tenantEvents = group.Select(x => x.Event).ToList();
-
+            var events = group.Select(x => x.Event).ToList();
             try
             {
-                // Process the entire flattened list of events for this tenant in a single DB transaction
-                await _syncService.ProcessPushBatchAsync(tenantId, tenantEvents, context.CancellationToken);
-                
-                // Notify connected clients via SignalR that updates are available
-                await _hubContext.Clients.All.SendAsync("todosChanged", new { changeId = tenantEvents.Count }, context.CancellationToken);
+                // This is the original Todo processing path.
+                await _todoSyncService.ProcessPushBatchAsync(group.Key, events, context.CancellationToken);
+                await _hubContext.Clients.All.SendAsync(
+                    "todosChanged",
+                    new { changeId = events.Count },
+                    context.CancellationToken);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to process push batch for tenant {TenantId}. Messages will be retried.", tenantId);
-                throw; // Rethrow lets MassTransit handle retries and moving to poison/DLQ
+                _metrics.RecordConsumerFailure("todo", FailureReason(ex));
+                _logger.LogError(
+                    ex,
+                    "Failed to process legacy Todo batch for tenant {TenantId}. Messages will be retried.",
+                    group.Key);
+                throw;
             }
         }
     }
+
+    public async Task Consume(ConsumeContext<Batch<GenericSyncPushMessage>> context)
+    {
+        var groups = context.Message
+            .SelectMany(message => message.Message.Mutations.Select(mutation => new
+            {
+                message.Message.TenantId,
+                Mutation = mutation
+            }))
+            .GroupBy(x => x.TenantId);
+
+        foreach (var group in groups)
+        {
+            var mutations = group.Select(x => x.Mutation).ToList();
+            try
+            {
+                var result = await _syncService.ProcessBatchAsync(
+                    group.Key,
+                    mutations,
+                    context.CancellationToken);
+
+                if (result.AppliedMutations > 0)
+                {
+                    var notification = new
+                    {
+                        serverWatermark = result.ServerWatermark,
+                        entityTypes = result.EntityTypes
+                    };
+                    await _hubContext.Clients.All.SendAsync(
+                        "changesAvailable",
+                        notification,
+                        context.CancellationToken);
+                    await _hubContext.Clients.All.SendAsync(
+                        "todosChanged",
+                        notification,
+                        context.CancellationToken);
+                }
+            }
+            catch (Exception ex)
+            {
+                var entityType = mutations.Select(x => x.EntityType).Distinct().Count() == 1
+                    ? mutations[0].EntityType
+                    : "mixed";
+                _metrics.RecordConsumerFailure(entityType, FailureReason(ex));
+                _logger.LogError(
+                    ex,
+                    "Failed to process generic sync batch for tenant {TenantId}. Messages will be retried.",
+                    group.Key);
+                throw;
+            }
+        }
+    }
+
+    private static string FailureReason(Exception exception) => exception switch
+    {
+        SyncValidationException => "validation",
+        Microsoft.EntityFrameworkCore.DbUpdateConcurrencyException => "concurrency",
+        _ => "transient_or_unknown"
+    };
 }

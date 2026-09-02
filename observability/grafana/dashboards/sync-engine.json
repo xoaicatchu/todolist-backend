@@ -1,0 +1,62 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "panels": [
+    {
+      "title": "Sync operation p95 (ms)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, operation) (rate(sync_operation_duration_ms_bucket[5m])))",
+          "legendFormat": "{{operation}}"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 }
+    },
+    {
+      "title": "Sync error rate",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum(rate(sync_operations_total{outcome=\"error\"}[5m])) / clamp_min(sum(rate(sync_operations_total[5m])), 0.001)",
+          "legendFormat": "error rate"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 }
+    },
+    {
+      "title": "Pull lag p95 (ms)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(sync_pull_lag_ms_bucket[5m])))",
+          "legendFormat": "pull lag"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 }
+    },
+    {
+      "title": "Duplicates and consumer failures",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum by (entity_type) (rate(sync_mutation_duplicates_total[5m]))",
+          "legendFormat": "duplicates {{entity_type}}"
+        },
+        {
+          "expr": "sum by (reason) (rate(sync_consumer_failures_total[5m]))",
+          "legendFormat": "failures {{reason}}"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 }
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["todosync", "sync"],
+  "templating": { "list": [] },
+  "time": { "from": "now-6h", "to": "now" },
+  "timezone": "browser",
+  "title": "TodoSync Generic Sync Engine",
+  "uid": "todosync-generic-sync-v2",
+  "version": 1
+}

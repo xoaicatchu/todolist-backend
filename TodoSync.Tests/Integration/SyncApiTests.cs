@@ -133,9 +133,9 @@ public class SyncApiTests : IClassFixture<TodoSyncWebApplicationFactory>
         pullResult.HasMore.Should().BeTrue();
         pullResult.NextCursor.Should().NotBeNullOrEmpty();
 
-        // Act - Pull second page using sinceChangeId (from NextCursor which is the last ChangeId)
-        var sinceId = pullResult.NextCursor;
-        var pullResponse2 = await _client.GetAsync($"/api/v2/sync/pull?limit=5&sinceChangeId={sinceId}");
+        // Act - Pull second page using the opaque cursor.
+        var nextCursor = Uri.EscapeDataString(pullResult.NextCursor!);
+        var pullResponse2 = await _client.GetAsync($"/api/v2/sync/pull?limit=5&cursor={nextCursor}");
         pullResponse2.EnsureSuccessStatusCode();
 
         var pullResult2 = await pullResponse2.Content.ReadFromJsonAsync<SyncPullV2Response>();
@@ -181,6 +181,46 @@ public class SyncApiTests : IClassFixture<TodoSyncWebApplicationFactory>
         var allTodos = await allResponse.Content.ReadFromJsonAsync<List<TodoItem>>();
         allTodos.Should().NotBeNull();
         allTodos!.Count(t => t.Id == todoId).Should().Be(1);
+    }
+
+    [Fact]
+    public async Task GenericTodoMutation_ShouldUseExistingTodoFlow()
+    {
+        var todoId = Guid.NewGuid().ToString();
+        var mutationId = Guid.NewGuid().ToString();
+        var request = new
+        {
+            mutations = new[]
+            {
+                new
+                {
+                    mutationId,
+                    entityType = "todo",
+                    entityId = todoId,
+                    mutationType = "TODO_CREATED",
+                    schemaVersion = 1,
+                    occurredAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                    payload = new
+                    {
+                        title = "Generic wrapper",
+                        priority = "MEDIUM",
+                        dayKey = "2026-09-02"
+                    }
+                }
+            }
+        };
+
+        var pushResponse = await _client.PostAsJsonAsync("/api/v2/sync/push", request);
+        pushResponse.EnsureSuccessStatusCode();
+        var pushResult = await pushResponse.Content.ReadFromJsonAsync<
+            TodoSync.Api.Sync.Contracts.GenericSyncPushResponse>();
+        pushResult!.AcceptedMutationIds.Should().ContainSingle().Which.Should().Be(mutationId);
+
+        await WaitUntilAsync(async () => await GetTodo(todoId) is not null);
+
+        var todo = await GetTodo(todoId);
+        todo.Should().NotBeNull();
+        todo!.Title.Should().Be("Generic wrapper");
     }
 
     [Fact]

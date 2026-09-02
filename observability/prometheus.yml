@@ -9,7 +9,7 @@ scrape_configs:
   # TodoSync API metrics
   - job_name: 'todosync-api'
     static_configs:
-      - targets: ['host.docker.internal:3000']
+      - targets: ['app1:3000', 'app2:3000', 'app3:3000']
         labels:
           service: 'todosync-api'
           version: '2.0.0'

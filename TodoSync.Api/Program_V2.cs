@@ -14,6 +14,10 @@ using TodoSync.Api.Data.Repositories;
 using TodoSync.Api.Hubs;
 using TodoSync.Api.Models;
 using TodoSync.Api.Services;
+using TodoSync.Api.Sync.Contracts;
+using TodoSync.Api.Sync.Core;
+using TodoSync.Api.Sync.Observability;
+using TodoSync.Api.Todos.Sync;
 
 var builder = WebApplication.CreateBuilder(args);
 var config = builder.Configuration;
@@ -80,6 +84,15 @@ builder.Services.AddMassTransit(x =>
         cfg.ReceiveEndpoint("sync-events", e =>
         {
             e.PrefetchCount = 100;
+            e.UseMessageRetry(r =>
+            {
+                r.Exponential(
+                    retryLimit: 5,
+                    minInterval: TimeSpan.FromMilliseconds(200),
+                    maxInterval: TimeSpan.FromSeconds(10),
+                    intervalDelta: TimeSpan.FromSeconds(2));
+                r.Ignore<SyncValidationException>();
+            });
             e.ConfigureConsumer<SyncEventConsumer>(context);
         });
 
@@ -95,28 +108,20 @@ builder.WebHost.ConfigureKestrel(options =>
 
 // ==================== PHASE 4: OBSERVABILITY ====================
 
-// OpenTelemetry Tracing
-// builder.Services.AddOpenTelemetry()
-//     .ConfigureResource(resource => resource
-//         .AddService(
-//             serviceName: config["OpenTelemetry:ServiceName"]!,
-//             serviceVersion: config["OpenTelemetry:ServiceVersion"]))
-//     .WithTracing(tracing => tracing
-//         .AddAspNetCoreInstrumentation()
-//         .AddHttpClientInstrumentation()
-//         .AddSource("TodoSync.*"))
-//     .WithMetrics(metrics => metrics
-//         .AddAspNetCoreInstrumentation()
-//         .AddHttpClientInstrumentation()
-//         .AddRuntimeInstrumentation()
-//         .AddPrometheusExporter());
-
-// // Activity Source for custom tracing
-// ActivitySource.AddActivityListener(new ActivityListener
-// {
-//     ShouldListenTo = source => source.Name.StartsWith("TodoSync"),
-//     Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllDataAndRecorded
-// });
+builder.Services.AddOpenTelemetry()
+    .ConfigureResource(resource => resource
+        .AddService(
+            serviceName: config["OpenTelemetry:ServiceName"] ?? "TodoSync.Api",
+            serviceVersion: config["OpenTelemetry:ServiceVersion"]))
+    .WithTracing(tracing => tracing
+        .AddAspNetCoreInstrumentation()
+        .AddHttpClientInstrumentation())
+    .WithMetrics(metrics => metrics
+        .AddAspNetCoreInstrumentation()
+        .AddHttpClientInstrumentation()
+        .AddRuntimeInstrumentation()
+        .AddMeter(SyncMetrics.MeterName)
+        .AddPrometheusExporter());
 
 // ==================== PHASE 5: RATE LIMITING ====================
 builder.Services.AddRateLimiter(options =>
@@ -160,6 +165,12 @@ builder.Services.AddSignalR()
 
 // ==================== SERVICES ====================
 builder.Services.AddScoped<ITodoSyncService, TodoSyncService>();
+builder.Services.AddScoped<ISyncMutationHandler, TodoMutationHandler>();
+builder.Services.AddScoped<SyncHandlerRegistry>();
+builder.Services.AddScoped<ISyncService, SyncService>();
+builder.Services.AddSingleton<SyncCursorCodec>();
+builder.Services.AddSingleton<SyncMetrics>();
+builder.Services.AddSingleton<TodoEventAdapter>();
 
 // Keep legacy service for backward compatibility (read-only mode)
 builder.Services.AddSingleton<IEventStoreService, EventStoreService>();
@@ -181,11 +192,9 @@ var app = builder.Build();
 
 // ==================== MIDDLEWARE PIPELINE ====================
 
-// Prometheus metrics endpoint (disabled - OpenTelemetry services are not configured)
-// app.UseOpenTelemetryPrometheusScrapingEndpoint();
-
 app.UseCors("Frontend");
 app.UseRateLimiter();
+app.MapPrometheusScrapingEndpoint("/metrics");
 
 // ==================== HEALTH CHECK ENDPOINTS ====================
 app.MapHealthChecks("/health");
@@ -208,13 +217,41 @@ app.MapGet("/", () => Results.Ok(new
 // V2 Push - Production version with database (Async Write Buffer)
 app.MapPost("/api/v2/sync/push", async (
     SyncPushRequest request,
-    ITodoSyncService syncService,
+    ITodoSyncService todoSyncService,
+    ISyncService syncService,
     CancellationToken ct) =>
 {
-    var response = await syncService.PushAsync(request, "default", ct);
+    try
+    {
+        if (request.Events.Count > 0 && request.Mutations.Count > 0)
+        {
+            throw new SyncValidationException(
+                "SYNC_PUSH_FORMAT_AMBIGUOUS",
+                "Provide either events or mutations, not both.");
+        }
 
-    // Return 202 Accepted since the processing is now asynchronous
-    return Results.Accepted(value: response);
+        if (request.Mutations.Count > 0)
+        {
+            var genericResponse = await syncService.PushAsync(request.Mutations, "default", ct);
+            return Results.Accepted(value: genericResponse);
+        }
+
+        // Legacy Todo request: preserve its request, queue message and response contract.
+        var todoResponse = await todoSyncService.PushAsync(request, "default", ct);
+        return Results.Accepted(value: todoResponse);
+    }
+    catch (SyncValidationException ex)
+    {
+        return Results.BadRequest(new
+        {
+            type = "https://todosync.dev/problems/sync-validation",
+            title = "Invalid sync mutation",
+            status = StatusCodes.Status400BadRequest,
+            code = ex.Code,
+            mutationId = ex.MutationId,
+            detail = ex.Message
+        });
+    }
 })
 .RequireRateLimiting("sync-write")
 .WithName("PushV2")
@@ -225,20 +262,35 @@ app.MapGet("/api/v2/sync/pull", async (
     Guid? sinceChangeId,
     int? limit,
     string? cursor,
-    ITodoSyncService syncService,
+    string? entityTypes,
+    ISyncService syncService,
     CancellationToken ct) =>
 {
-    var take = limit ?? 300;
-
-    // If sinceChangeId is not provided but cursor is, parse cursor as the sinceChangeId
-    var effectiveSinceChangeId = sinceChangeId;
-    if (effectiveSinceChangeId == null && !string.IsNullOrEmpty(cursor) && Guid.TryParse(cursor, out var cursorGuid))
+    try
     {
-        effectiveSinceChangeId = cursorGuid;
+        var scope = string.IsNullOrWhiteSpace(entityTypes)
+            ? new[] { "todo" }
+            : entityTypes.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var response = await syncService.PullAsync(
+            sinceChangeId,
+            limit ?? 300,
+            cursor,
+            scope,
+            "default",
+            ct);
+        return Results.Ok(response);
     }
-
-    var response = await syncService.PullV2Async(effectiveSinceChangeId, take, cursor, "default", ct);
-    return Results.Ok(response);
+    catch (SyncValidationException ex)
+    {
+        return Results.BadRequest(new
+        {
+            type = "https://todosync.dev/problems/sync-validation",
+            title = "Invalid sync cursor or scope",
+            status = StatusCodes.Status400BadRequest,
+            code = ex.Code,
+            detail = ex.Message
+        });
+    }
 })
 .RequireRateLimiting("sync-read")
 .WithName("PullV2")
